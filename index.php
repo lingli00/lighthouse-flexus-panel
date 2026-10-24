@@ -79,8 +79,16 @@ define('SESSION_TTL', 3600);
 // 云 API 请求超时（秒）
 define('API_TIMEOUT', 25);
 
+// ---------------------------------------------------------------------------
+// 阿里云（云解析 DNS）配置 —— 与其他云相同，两种方式二选一：
+//  ① 服务端配置：在下面写死 AK / SK（写好后前端「域名解析 DNS」可直接使用）
+//  ② 前端配置：保持留空，由「域名解析 DNS → DNS 密钥配置」面板传入
+// ---------------------------------------------------------------------------
+define('ALI_AK', '');
+define('ALI_SK', '');
+
 // 面板版本（显示在「说明 / 风险」页的环境自检里，用于确认服务器上跑的是最新版）
-define('PANEL_VERSION', 'v1.0.2');
+define('PANEL_VERSION', 'v1.1.0');
 
 // 前端 CDN（如果服务器访问不畅，可自行下载文件放到站点目录并改成相对路径）
 define('CDN_TAILWIND', 'https://cdn.tailwindcss.com/3.4.1');
@@ -1934,6 +1942,201 @@ class HuaweiAdapter implements CloudAdapter
 }
 
 /* ==========================================================================
+ *  八A、阿里云云解析 DNS（RPC 签名 v1.0 / HMAC-SHA1，零依赖）
+ * ---------------------------------------------------------------------------
+ *  仅提供解析记录管理（域名列表 / 记录增删改 / 启停）。全球端点 alidns.aliyuncs.com，
+ *  全部参数走查询串。签名算法为阿里云 RPC v1.0：
+ *    StringToSign = HTTPMethod + '&' + PercentEncode('/') + '&' + PercentEncode(CanonicalQueryString)
+ *    Signature    = Base64(HMAC-SHA1(StringToSign, SK + '&'))
+ *  PercentEncode：RFC3986 且 * 编码为 %2A、~ 不编码 —— 与 PHP rawurlencode 行为一致。
+ * ========================================================================== */
+
+/* --- 阿里云运行时密钥：dispatch 注入（前端 DNS 密钥配置）或回退配置区常量 --- */
+function ali_cred(): array
+{
+    $c  = (array)($GLOBALS['ALI_CRED'] ?? []);
+    // 用 ?:（空字符串也回退）：前端未配置时传空串，需回退到服务端配置区常量
+    $ak = trim((string)($c['ak'] ?? '')) ?: ALI_AK;
+    $sk = trim((string)($c['sk'] ?? '')) ?: ALI_SK;
+    if ($ak === '' || $sk === '') {
+        throw new ApiError('阿里云密钥未配置：请在「域名解析 DNS → DNS 密钥配置」中填写，或在 index.php 配置区设置 ALI_AK / ALI_SK（两种方式二选一）');
+    }
+    return ['ak' => $ak, 'sk' => $sk];
+}
+
+function ali_call(string $action, array $params = []): array
+{
+    if (!function_exists('curl_init')) {
+        throw new ApiError('当前 PHP 未启用 curl 扩展，请在宝塔「软件商店 → PHP-设置 → 安装扩展」中安装 curl 后重试');
+    }
+    $cred = ali_cred();
+    $base = array_merge($params, [
+        'Action'           => $action,
+        'Format'           => 'JSON',
+        'Version'          => '2015-01-09',
+        'AccessKeyId'      => $cred['ak'],
+        'SignatureMethod'  => 'HMAC-SHA1',
+        'SignatureVersion' => '1.0',
+        'SignatureNonce'   => bin2hex(random_bytes(8)),
+        'Timestamp'        => gmdate('Y-m-d\TH:i:s\Z'),
+    ]);
+    ksort($base);
+    $pairs = [];
+    foreach ($base as $k => $v) {
+        $pairs[] = rawurlencode((string)$k) . '=' . rawurlencode((string)$v);
+    }
+    $canonical = implode('&', $pairs);
+    $stringToSign = 'GET&' . rawurlencode('/') . '&' . rawurlencode($canonical);
+    $signature = base64_encode(hash_hmac('sha1', $stringToSign, $cred['sk'] . '&', true));
+    $url = 'https://alidns.aliyuncs.com/?' . $canonical . '&Signature=' . rawurlencode($signature);
+
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => API_TIMEOUT,
+        CURLOPT_CONNECTTIMEOUT => 8,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+        CURLOPT_USERAGENT      => 'ali-dns-panel/1.0',
+    ]);
+    $resp = curl_exec($ch);
+    $err  = curl_error($ch);
+    $http = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    if ($resp === false) {
+        throw new ApiError('网络请求失败（无法访问阿里云 DNS API）：' . $err);
+    }
+    $data = json_decode((string)$resp, true);
+    if (!is_array($data)) {
+        throw new ApiError('阿里云返回内容无法解析（HTTP ' . $http . '）：' . str_cut((string)$resp, 200));
+    }
+    if (isset($data['Code'])) {
+        throw new ApiError(ali_friendly_error((string)$data['Code'], (string)($data['Message'] ?? '')), (string)$data['Code']);
+    }
+    return $data;
+}
+
+function ali_friendly_error(string $code, string $msg): string
+{
+    $map = [
+        'InvalidAccessKeyId.NotFound' => '鉴权失败：AccessKey 不存在（请检查 AK 是否填对）',
+        'SignatureDoesNotMatch'       => '鉴权失败：签名不匹配（通常是 SK 填写错误）',
+        'InvalidDomainName.NoExist'   => '域名不存在：该密钥名下没有此域名（域名可能归属其他账号）',
+        'ForbiddenAccessKey'          => '无权限：该 AK 被禁用或无云解析（AliyunDNSFullAccess）权限',
+        'DomainExists'                => '记录冲突：已存在相同主机记录与类型的记录',
+        'RecordForbidden.BlackHole'   => '该记录处于黑洞保护中，暂不可操作',
+    ];
+    if (isset($map[$code])) return $map[$code] . '（' . $code . '）';
+    return ($msg ?: '阿里云 DNS API 调用失败') . '（' . $code . '）';
+}
+
+/* ---------- 阿里云 DNS 业务接口 ---------- */
+
+/** 域名列表（前 100 个） */
+function biz_ali_domains(): array
+{
+    $r = ali_call('DescribeDomains', ['PageSize' => 100, 'PageNumber' => 1]);
+    $out = [];
+    foreach ((array)(($r['Domains'] ?? [])['Domain'] ?? []) as $x) {
+        $out[] = ['name' => (string)($x['DomainName'] ?? '')];
+    }
+    return ['domains' => $out, 'backendCred' => (ALI_AK !== '' && ALI_SK !== '')];
+}
+
+/** 解析记录列表（前 100 条） */
+function biz_ali_records(string $domain): array
+{
+    if ($domain === '') throw new ApiError('请先选择域名');
+    $r = ali_call('DescribeDomainRecords', ['DomainName' => $domain, 'PageSize' => 100, 'PageNumber' => 1]);
+    $out = [];
+    foreach ((array)(($r['DomainRecords'] ?? [])['Record'] ?? []) as $x) {
+        $out[] = [
+            'id'       => (string)($x['RecordId'] ?? ''),
+            'rr'       => (string)($x['RR'] ?? '@'),
+            'type'     => (string)($x['Type'] ?? ''),
+            'value'    => (string)($x['Value'] ?? ''),
+            'ttl'      => (int)($x['TTL'] ?? 600),
+            'priority' => (int)($x['Priority'] ?? 0),
+            'status'   => (string)($x['Status'] ?? ''), // ENABLE / DISABLE
+            'locked'   => !empty($x['Locked']),
+            'remark'   => (string)($x['Remark'] ?? ''),
+        ];
+    }
+    // @ 排最前，其余按主机记录、类型排序
+    usort($out, fn($a, $b) => (($a['rr'] === '@' ? '' : $a['rr']) <=> ($b['rr'] === '@' ? '' : $b['rr'])) ?: strcmp($a['type'], $b['type']));
+    return ['records' => $out, 'domain' => $domain];
+}
+
+/** 校验并规范化解析记录参数 */
+function ali_check_record(array $r): array
+{
+    $rr    = trim((string)($r['rr'] ?? ''));
+    $type  = strtoupper(trim((string)($r['type'] ?? '')));
+    $value = trim((string)($r['value'] ?? ''));
+    $ttl   = (int)($r['ttl'] ?? 600);
+    $prio  = (int)($r['priority'] ?? 10);
+    if ($rr === '') throw new ApiError('主机记录不能为空（根域名请填 @）');
+    if (!in_array($type, ['A', 'AAAA', 'CNAME', 'TXT', 'MX', 'NS', 'CAA', 'SRV'], true)) {
+        throw new ApiError('记录类型仅支持 A / AAAA / CNAME / TXT / MX / NS / CAA / SRV');
+    }
+    if ($value === '') throw new ApiError('记录值不能为空');
+    if ($type === 'TXT' && strlen($value) > 512) throw new ApiError('TXT 记录值过长（≤512 字符）');
+    if ($ttl < 600 || $ttl > 86400) throw new ApiError('TTL 取值范围 600~86400 秒');
+    if ($type === 'MX' && ($prio < 1 || $prio > 50)) throw new ApiError('MX 优先级取值范围 1~50');
+    return ['rr' => $rr, 'type' => $type, 'value' => $value, 'ttl' => $ttl, 'priority' => $prio];
+}
+
+function biz_ali_record_add(array $d): array
+{
+    $domain = (string)($d['domain'] ?? '');
+    if ($domain === '') throw new ApiError('请先选择域名');
+    $rec = ali_check_record((array)($d['record'] ?? []));
+    $p = ['DomainName' => $domain, 'RR' => $rec['rr'], 'Type' => $rec['type'], 'Value' => $rec['value'], 'TTL' => $rec['ttl']];
+    if ($rec['type'] === 'MX') $p['Priority'] = $rec['priority'];
+    ali_call('AddDomainRecord', $p);
+    write_log('AliDnsAdd', $domain . '/' . $rec['rr'], 'success', $rec['type'] . ' -> ' . $rec['value']);
+    return ['msg' => '解析记录已添加'];
+}
+
+function biz_ali_record_upd(array $d): array
+{
+    $rid = (string)($d['recordId'] ?? '');
+    if ($rid === '') throw new ApiError('缺少记录 ID，请刷新后重试');
+    $rec = ali_check_record((array)($d['record'] ?? []));
+    $p = ['RecordId' => $rid, 'RR' => $rec['rr'], 'Type' => $rec['type'], 'Value' => $rec['value'], 'TTL' => $rec['ttl']];
+    if ($rec['type'] === 'MX') $p['Priority'] = $rec['priority'];
+    ali_call('UpdateDomainRecord', $p);
+    write_log('AliDnsUpdate', $rid, 'success', $rec['type'] . ' -> ' . $rec['value']);
+    return ['msg' => '解析记录已更新'];
+}
+
+function biz_ali_record_del(array $d): array
+{
+    $rid = (string)($d['recordId'] ?? '');
+    if ($rid === '') throw new ApiError('缺少记录 ID，请刷新后重试');
+    ali_call('DeleteDomainRecord', ['RecordId' => $rid]);
+    write_log('AliDnsDelete', $rid, 'success', '删除解析记录');
+    return ['msg' => '解析记录已删除'];
+}
+
+function biz_ali_record_status(array $d): array
+{
+    $rid = (string)($d['recordId'] ?? '');
+    if ($rid === '') throw new ApiError('缺少记录 ID，请刷新后重试');
+    $status = strtoupper((string)($d['status'] ?? '')) === 'DISABLE' ? 'Disable' : 'Enable';
+    ali_call('SetDomainRecordStatus', ['RecordId' => $rid, 'Status' => $status]);
+    write_log('AliDnsStatus', $rid, 'success', '记录状态 ' . $status);
+    return ['msg' => $status === 'Enable' ? '记录已启用' : '记录已暂停'];
+}
+
+/** 连通性测试（读取权限即认为可用） */
+function biz_ali_test(): array
+{
+    $r = ali_call('DescribeDomains', ['PageSize' => 1, 'PageNumber' => 1]);
+    return ['msg' => '阿里云 DNS 连通成功：密钥有效，名下域名 ' . (int)($r['TotalCount'] ?? 0) . ' 个'];
+}
+
+/* ==========================================================================
  *  九、登录 / 鉴权 / 路由
  * ========================================================================== */
 
@@ -2008,6 +2211,10 @@ function dispatch(string $action, array $d): void
             'project' => trim((string)($cred['project'] ?? '')),
         ];
     }
+    // 阿里云 DNS：独立密钥（前端「DNS 密钥配置」传入，或回退配置区 ALI_AK / ALI_SK）
+    if (strpos($action, 'ali_') === 0) {
+        $GLOBALS['ALI_CRED'] = ['ak' => trim((string)($cred['ak'] ?? '')), 'sk' => trim((string)($cred['sk'] ?? ''))];
+    }
 
     try {
         $ad = make_adapter($cloud);
@@ -2029,6 +2236,13 @@ function dispatch(string $action, array $d): void
             case 'monitor':     json_out(['ok' => true, 'data' => $ad->monitor($d)]);
             case 'test_conn':   json_out(['ok' => true, 'data' => $ad->testConn($d)]);
             case 'hw_project':  json_out(['ok' => true, 'data' => hw_project_info(trim((string)($d['projectId'] ?? '')))]);
+            case 'ali_test':          json_out(['ok' => true, 'data' => biz_ali_test()]);
+            case 'ali_domains':       json_out(['ok' => true, 'data' => biz_ali_domains()]);
+            case 'ali_records':       json_out(['ok' => true, 'data' => biz_ali_records((string)($d['domain'] ?? ''))]);
+            case 'ali_record_add':    json_out(['ok' => true, 'data' => biz_ali_record_add($d)]);
+            case 'ali_record_upd':    json_out(['ok' => true, 'data' => biz_ali_record_upd($d)]);
+            case 'ali_record_del':    json_out(['ok' => true, 'data' => biz_ali_record_del($d)]);
+            case 'ali_record_status': json_out(['ok' => true, 'data' => biz_ali_record_status($d)]);
             case 'log_list':    json_out(['ok' => true, 'data' => ['logs' => read_logs(200), 'file' => LOG_FILE]]);
             default:            json_out(['ok' => false, 'msg' => '未知操作：' . $action]);
         }
@@ -2257,6 +2471,7 @@ function render_page(): void
     <button class="tab-btn px-4 py-2 rounded-xl text-sm bg-white border border-slate-200" data-tab="snapshot">快照备份</button>
     <button class="tab-btn px-4 py-2 rounded-xl text-sm bg-white border border-slate-200" data-tab="monitor">监控</button>
     <button class="tab-btn px-4 py-2 rounded-xl text-sm bg-white border border-slate-200" data-tab="logs">操作日志</button>
+    <button class="tab-btn px-4 py-2 rounded-xl text-sm bg-white border border-slate-200" data-tab="dns">域名解析 DNS</button>
     <button class="tab-btn px-4 py-2 rounded-xl text-sm bg-white border border-slate-200" data-tab="about">说明 / 风险</button>
   </div>
 </div>
@@ -2367,6 +2582,37 @@ function render_page(): void
         </table>
       </div>
       <div id="logEmpty" class="hidden text-center text-sm text-slate-400 py-8">暂无日志记录</div>
+    </div>
+  </section>
+
+  <!-- ============ 域名解析 DNS（阿里云） ============ -->
+  <section id="tab-dns" class="tab-pane hidden">
+    <div class="bg-white rounded-2xl shadow-sm p-5">
+      <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
+        <div>
+          <h2 class="font-bold text-slate-800">域名解析（阿里云云解析 DNS）<span id="dnsDomain" class="text-xs font-normal text-slate-400"></span></h2>
+          <p class="text-xs text-slate-400 mt-1">解析记录管理：添加 / 编辑 / 删除 / 暂停启用。密钥仅存浏览器 localStorage 或 index.php 配置区，后端不持久化。</p>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <button id="btnDnsKey" class="px-4 py-2 rounded-xl border border-blue-600 text-blue-600 text-sm hover:bg-blue-50">DNS 密钥配置</button>
+          <button id="btnDnsRefresh" class="px-4 py-2 rounded-xl bg-slate-800 text-white text-sm">刷新</button>
+          <button id="btnDnsAdd" class="px-4 py-2 rounded-xl bg-blue-600 text-white text-sm hover:bg-blue-700">+ 添加记录</button>
+        </div>
+      </div>
+      <div class="flex flex-wrap items-center gap-3 mb-3">
+        <label class="text-xs text-slate-500 shrink-0">域名</label>
+        <select id="selDnsDomain" class="flex-1 min-w-0 rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none focus:border-blue-500"></select>
+        <span id="dnsCredState" class="text-xs text-slate-400"></span>
+      </div>
+      <div class="overflow-x-auto rounded-xl border border-slate-200">
+        <table class="min-w-full text-sm">
+          <thead class="bg-slate-50 text-slate-500 text-xs">
+            <tr><th class="px-4 py-3 text-left">主机记录</th><th class="px-4 py-3 text-left">类型</th><th class="px-4 py-3 text-left">记录值</th><th class="px-4 py-3 text-left">TTL(秒)</th><th class="px-4 py-3 text-left">优先级</th><th class="px-4 py-3 text-left">状态</th><th class="px-4 py-3 text-right">操作</th></tr>
+          </thead>
+          <tbody id="dnsBody" class="divide-y divide-slate-100"></tbody>
+        </table>
+      </div>
+      <div id="dnsEmpty" class="hidden text-center text-sm text-slate-400 py-8">暂无解析记录</div>
     </div>
   </section>
 
@@ -2496,6 +2742,7 @@ function loadCred(){
   try{ c=JSON.parse(localStorage.getItem('lhpanel.cred.v1')||'{}'); }catch(e){}
   c.tencent=c.tencent||{ak:'',sk:''};
   c.huawei=c.huawei||{ak:'',sk:'',project:''};
+  c.ali=c.ali||{ak:'',sk:''};
   return c;
 }
 S.cred = loadCred();
@@ -2675,6 +2922,7 @@ function bindTabs(){
       if(name==='snapshot') loadSnapshots();
       if(name==='monitor') loadMonitor();
       if(name==='logs') loadLogs();
+      if(name==='dns') loadDnsDomains();
     });
   });
 }
@@ -2694,6 +2942,7 @@ function bindEvents(){
     });
   });
   $('#btnLogRefresh').addEventListener('click',loadLogs);
+  bindDns();
 
   const tpls=[
     {p:'22',d:'SSH 远程登录'},{p:'80',d:'HTTP 网站'},{p:'443',d:'HTTPS 网站'},
@@ -3285,6 +3534,189 @@ function drawFallbackCanvasSilent(canvas,pts,unit,max,xs,ys,pad,W,H){
   ctx.stroke();
   ctx.lineTo(xs(pts.length-1),H-pad.b); ctx.lineTo(xs(0),H-pad.b); ctx.closePath();
   ctx.fillStyle='rgba(37,99,235,.1)'; ctx.fill();
+}
+
+/* ---------- 阿里云域名解析 DNS ---------- */
+S.dns={domains:[],domain:'',records:[],backendCred:false};
+function aliCred(){
+  const c=S.cred.ali||{};
+  return {ak:c.ak||'', sk:c.sk||''};
+}
+function bindDns(){
+  $('#btnDnsRefresh').addEventListener('click',()=>loadDnsDomains(true));
+  $('#btnDnsAdd').addEventListener('click',()=>openDnsForm(null));
+  $('#btnDnsKey').addEventListener('click',openDnsKeyForm);
+  $('#selDnsDomain').addEventListener('change',()=>{ S.dns.domain=$('#selDnsDomain').value; loadDnsRecords(); });
+}
+async function loadDnsDomains(keep){
+  const body=$('#dnsBody'), empty=$('#dnsEmpty'), el=$('#selDnsDomain');
+  try{
+    const d=await api('ali_domains',{cred:aliCred()});
+    S.dns.domains=d.domains||[];
+    S.dns.backendCred=!!d.backendCred;
+    $('#dnsCredState').textContent=S.dns.backendCred?'服务端已配置密钥':'';
+    el.innerHTML=S.dns.domains.length? S.dns.domains.map(x=>'<option value="'+esc(x.name)+'">'+esc(x.name)+'</option>').join('') : '<option value="">该密钥名下没有域名</option>';
+    const want=(keep&&S.dns.domain)?S.dns.domain:(S.dns.domains[0]?.name||'');
+    if(S.dns.domains.some(x=>x.name===want)){ el.value=want; S.dns.domain=want; }
+    else { S.dns.domain=el.value||''; }
+    $('#dnsDomain').textContent=S.dns.domain?('（'+S.dns.domain+'）'):'';
+    if(!S.dns.domain){ S.dns.records=[]; body.innerHTML=''; $('#dnsCredState').textContent=''; empty.classList.remove('hidden'); empty.textContent='该密钥名下没有域名'; return; }
+    await loadDnsRecords();
+  }catch(e){
+    S.dns.records=[]; S.dns.domain=''; body.innerHTML='';
+    $('#dnsDomain').textContent=''; $('#dnsCredState').textContent='';
+    el.innerHTML='<option value="">加载失败</option>';
+    empty.classList.remove('hidden');
+    empty.textContent='加载失败：'+e.message;
+  }
+}
+async function loadDnsRecords(){
+  const body=$('#dnsBody'), empty=$('#dnsEmpty');
+  if(!S.dns.domain){ body.innerHTML=''; empty.classList.remove('hidden'); return; }
+  try{
+    const d=await api('ali_records',{cred:aliCred(),domain:S.dns.domain});
+    S.dns.records=d.records||[];
+    renderDnsRecords(S.dns.records);
+  }catch(e){
+    S.dns.records=[]; body.innerHTML='';
+    empty.classList.remove('hidden');
+    empty.textContent='加载失败：'+e.message;
+  }
+}
+function renderDnsRecords(list){
+  const body=$('#dnsBody'), empty=$('#dnsEmpty');
+  if(!list.length){ body.innerHTML=''; empty.classList.remove('hidden'); empty.textContent='暂无解析记录，点右上角「+ 添加记录」'; return; }
+  empty.classList.add('hidden');
+  body.innerHTML=list.map((r,idx)=>{
+    const on=r.status==='ENABLE';
+    return `
+    <tr class="hover:bg-slate-50">
+      <td class="px-4 py-3 font-medium text-slate-700">${esc(r.rr)}</td>
+      <td class="px-4 py-3"><span class="text-xs px-2 py-1 rounded-lg bg-slate-100 text-slate-600">${esc(r.type)}</span></td>
+      <td class="px-4 py-3 text-slate-600 break-all max-w-[280px]">${esc(r.value)}</td>
+      <td class="px-4 py-3 text-slate-500">${r.ttl}</td>
+      <td class="px-4 py-3 text-slate-500">${r.type==='MX'?r.priority:'-'}</td>
+      <td class="px-4 py-3"><span class="text-xs px-2 py-1 rounded-lg ${on?'bg-green-100 text-green-700':'bg-slate-100 text-slate-500'}">${on?'启用':'已暂停'}</span>${r.locked?'<div class="text-[11px] text-amber-600 mt-1">🔒 已锁定</div>':''}</td>
+      <td class="px-4 py-3 text-right whitespace-nowrap">
+        <button data-act="edit" data-idx="${idx}" class="dns-btn text-xs px-3 py-1.5 rounded-lg bg-blue-50 text-blue-600 hover:bg-blue-100">编辑</button>
+        <button data-act="toggle" data-idx="${idx}" ${r.locked?'disabled class="dns-btn text-xs px-3 py-1.5 rounded-lg bg-slate-100 text-slate-400 cursor-not-allowed"':'class="dns-btn text-xs px-3 py-1.5 rounded-lg bg-amber-50 text-amber-700 hover:bg-amber-100"'}>${on?'暂停':'启用'}</button>
+        <button data-act="del" data-idx="${idx}" ${r.locked?'disabled class="dns-btn text-xs px-3 py-1.5 rounded-lg bg-slate-100 text-slate-400 cursor-not-allowed"':'class="dns-btn text-xs px-3 py-1.5 rounded-lg bg-red-50 text-red-600 hover:bg-red-100"'}>删除</button>
+      </td>
+    </tr>`;
+  }).join('');
+  $$('#dnsBody .dns-btn').forEach(b=>b.addEventListener('click',()=>{
+    const r=list[+b.dataset.idx];
+    if(!r||r.locked) return;
+    if(b.dataset.act==='edit') openDnsForm(r);
+    else if(b.dataset.act==='del') askDeleteDns(r);
+    else toggleDnsStatus(r);
+  }));
+}
+const DNS_TYPES=['A','AAAA','CNAME','TXT','MX','NS','CAA','SRV'];
+function openDnsForm(rec){
+  const isEdit=!!rec;
+  openMask((isEdit?'编辑':'添加')+'解析记录'+(S.dns.domain?(' · '+S.dns.domain):''),`
+    <div class="space-y-3">
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs text-slate-500 mb-1">主机记录（根域名填 @，泛解析填 *）</label>
+          <input id="dRr" class="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm" value="${esc(rec?rec.rr:'')}" placeholder="www">
+        </div>
+        <div>
+          <label class="block text-xs text-slate-500 mb-1">记录类型</label>
+          <select id="dType" class="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm">
+            ${DNS_TYPES.map(t=>'<option value="'+t+'"'+(rec&&rec.type===t?' selected':'')+'>'+t+'</option>').join('')}
+          </select>
+        </div>
+      </div>
+      <div>
+        <label class="block text-xs text-slate-500 mb-1">记录值（A 填 IP、CNAME 填域名、TXT 填文本…）</label>
+        <input id="dValue" class="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm" value="${esc(rec?rec.value:'')}" placeholder="1.2.3.4">
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs text-slate-500 mb-1">TTL（秒，600~86400，越小生效越快）</label>
+          <input id="dTtl" type="number" min="600" max="86400" class="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm" value="${rec?rec.ttl:600}">
+        </div>
+        <div>
+          <label class="block text-xs text-slate-500 mb-1">优先级（仅 MX 记录有效，1~50）</label>
+          <input id="dPriority" type="number" min="1" max="50" class="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm" value="${rec?(rec.priority||10):10}">
+        </div>
+      </div>
+      <div class="text-xs text-slate-400">提示：相同主机记录+类型只能有一条（冲突会报错）；TTL 越小变更生效越快，但解析请求量越大。</div>
+    </div>`,isEdit?'保存修改':'添加',async()=>{
+      const record={
+        rr:$('#dRr').value.trim(), type:$('#dType').value,
+        value:$('#dValue').value.trim(), ttl:parseInt($('#dTtl').value,10)||600,
+        priority:parseInt($('#dPriority').value,10)||10
+      };
+      if(!record.rr){ toast('请填写主机记录（根域名填 @）','error'); return; }
+      if(!record.value){ toast('请填写记录值','error'); return; }
+      closeMask();
+      try{
+        const d=isEdit
+          ? await api('ali_record_upd',{cred:aliCred(),recordId:rec.id,record:record})
+          : await api('ali_record_add',{cred:aliCred(),domain:S.dns.domain,record:record});
+        toast(d.msg,'success'); loadDnsRecords();
+      }catch(e){ toast(e.message,'error'); }
+    },false);
+}
+function askDeleteDns(r){
+  openMask('删除解析记录',`
+    <div class="rounded-xl bg-red-50 text-red-700 px-4 py-3 mb-3">⚠ 删除后该解析立即失效，相关服务可能中断。</div>
+    <div class="text-sm space-y-1">
+      <div>主机记录：<b>${esc(r.rr)}</b></div>
+      <div>类型：<b>${esc(r.type)}</b></div>
+      <div class="break-all">记录值：<b>${esc(r.value)}</b></div>
+    </div>`,'确认删除',async()=>{
+      closeMask();
+      try{ const d=await api('ali_record_del',{cred:aliCred(),recordId:r.id}); toast(d.msg,'success'); loadDnsRecords(); }
+      catch(e){ toast(e.message,'error'); }
+    },true);
+}
+function toggleDnsStatus(r){
+  const to='ENABLE'===r.status?'DISABLE':'ENABLE';
+  try{
+    (async()=>{
+      const d=await api('ali_record_status',{cred:aliCred(),recordId:r.id,status:to});
+      toast(d.msg,'success'); loadDnsRecords();
+    })();
+  }catch(e){ toast(e.message,'error'); }
+}
+function openDnsKeyForm(){
+  const c=S.cred.ali||{};
+  openMask('阿里云 DNS 密钥配置',`
+    <div class="rounded-xl bg-blue-50 text-blue-800 px-4 py-3 text-sm leading-relaxed">
+      密钥仅保存在<b>本浏览器 localStorage</b>；${S.dns.backendCred?'<b class="text-green-700">检测到服务端 index.php 已配置 ALI_AK / ALI_SK，此处可留空。</b>':''}
+      建议使用仅授权「云解析 DNS（AliyunDNSFullAccess）」权限的子账号 AccessKey。
+    </div>
+    <div class="mt-3 space-y-3">
+      <div>
+        <label class="block text-xs text-slate-500 mb-1">AccessKey ID（AK）</label>
+        <input id="aAk" class="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm" value="${esc(c.ak||'')}" placeholder="LTAI...">
+      </div>
+      <div>
+        <label class="block text-xs text-slate-500 mb-1">AccessKey Secret（SK）</label>
+        <input id="aSk" type="password" class="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm" value="${esc(c.sk||'')}" placeholder="请输入 SK">
+      </div>
+    </div>`,'保存',async()=>{
+      S.cred.ali={ak:$('#aAk').value.trim(),sk:$('#aSk').value.trim()};
+      saveCred(); closeMask(); toast('DNS 密钥已保存到本浏览器','success'); loadDnsDomains();
+    });
+  $('#mkBody').insertAdjacentHTML('beforeend','<button id="btnDnsTest" class="mt-3 w-full px-4 py-2 rounded-xl border border-blue-600 text-blue-600 text-sm hover:bg-blue-50 transition">测试连通性</button>');
+  $('#btnDnsTest').addEventListener('click',async()=>{
+    S.cred.ali={ak:$('#aAk').value.trim(),sk:$('#aSk').value.trim()};
+    saveCred();
+    const btn=$('#btnDnsTest'); btn.disabled=true; btn.textContent='测试中...';
+    try{
+      const d=await api('ali_test',{cred:aliCred()});
+      btn.textContent='✓ 连通成功';
+      toast(d.msg||'连通成功','success');
+    }catch(e){
+      btn.disabled=false; btn.textContent='测试连通性';
+      toast('连通失败：'+e.message,'error');
+    }
+  });
 }
 
 /* ---------- 日志 ---------- */
