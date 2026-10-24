@@ -1102,9 +1102,11 @@ final class HwV4Sign
 function hw_cred(): array
 {
     $c  = (array)($GLOBALS['HW_CRED'] ?? []);
-    $ak = trim((string)($c['ak'] ?? HW_AK));
-    $sk = trim((string)($c['sk'] ?? HW_SK));
-    $pr = trim((string)($c['project'] ?? HW_PROJECT));
+    // 必须用 ?:（空字符串也回退）：前端未配置时传的是空串而非 null，
+    // 用 ?? 不会触发服务端配置区常量回退（这正是「服务端配置了华为密钥却不生效」的原因）
+    $ak = trim((string)($c['ak'] ?? '')) ?: HW_AK;
+    $sk = trim((string)($c['sk'] ?? '')) ?: HW_SK;
+    $pr = trim((string)($c['project'] ?? '')) ?: HW_PROJECT;
     if ($ak === '' || $sk === '') {
         throw new ApiError('华为云密钥未配置：请在顶部「密钥配置」中填写 AK / SK，或在 index.php 配置区设置 HW_AK / HW_SK（两种方式二选一）');
     }
@@ -2171,6 +2173,10 @@ function render_page(): void
   .no-tw .tw-hide{display:none}
   .fade-in{animation:fade .18s ease}
   @keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+  /* 监控图表容器：canvas 默认 min-width:auto 会撑破 grid 子项，导致手机端整页无限横向滑动 */
+  #tab-monitor .grid > div{min-width:0}
+  #tab-monitor canvas{max-width:100%}
+  body{overflow-x:hidden}
   /* ---- 移动端适配 ---- */
   html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
   @media (max-width:640px){
@@ -2180,6 +2186,7 @@ function render_page(): void
     input,select{font-size:16px !important}           /* 防 iOS 聚焦时页面自动放大 */
     td,th{word-break:break-word}
     .tab-btn,.cloud-tab{padding-left:12px;padding-right:12px}
+    #insCard{padding:14px !important}
   }
 </style>
 </head>
