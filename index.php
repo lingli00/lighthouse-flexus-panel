@@ -79,6 +79,9 @@ define('SESSION_TTL', 3600);
 // 云 API 请求超时（秒）
 define('API_TIMEOUT', 25);
 
+// 面板版本（显示在「说明 / 风险」页的环境自检里，用于确认服务器上跑的是最新版）
+define('PANEL_VERSION', 'v1.0.2');
+
 // 前端 CDN（如果服务器访问不畅，可自行下载文件放到站点目录并改成相对路径）
 define('CDN_TAILWIND', 'https://cdn.tailwindcss.com/3.4.1');
 define('CDN_CHARTJS',  'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js');
@@ -2078,6 +2081,7 @@ exit;
  * ========================================================================== */
 function render_login(): void
 {
+    header('Cache-Control: no-store, no-cache, must-revalidate');
     $html = <<<'HTML'
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -2141,7 +2145,9 @@ HTML;
  * ========================================================================== */
 function render_page(): void
 {
+    header('Cache-Control: no-store, no-cache, must-revalidate'); // 防止更新 index.php 后浏览器仍使用旧页面（旧 JS 会残留旧实例列表）
     $cfg = [
+        'version'  => PANEL_VERSION,
         'csrf'     => $_SESSION['csrf'],
         'region'   => DEFAULT_REGION,
         'authMode' => AUTH_MODE,
@@ -2549,6 +2555,7 @@ function applyBackendCredBadge(on){
     if(S.cloud===target) return;
     S.cloud=target; localStorage.setItem('lhpanel.cloud.v1',S.cloud);
     applyCloudUI();
+    $('#selInstance').innerHTML='<option value="">加载中...</option>'; // 清掉上一个云的残留
     try{
       const boot=await api('bootstrap');
       S.regions=boot.regions;
@@ -2642,6 +2649,7 @@ function openCredForm(){
 
 function renderEnvCheck(){
   const items=[];
+  items.push('面板版本 '+CFG.version);
   items.push((typeof tailwind!=='undefined'?'✔':'✘')+' Tailwind CSS 样式库');
   items.push((typeof Chart!=='undefined'?'✔':'✘（监控图将使用内置简易绘图）')+' Chart.js 图表库');
   items.push((CFG.logWritable?'✔':'✘（请给网站目录写权限）')+' 日志文件可写');
@@ -2672,7 +2680,7 @@ function bindTabs(){
 }
 
 function bindEvents(){
-  $('#selRegion').addEventListener('change',async()=>{ S.region=$('#selRegion').value; await loadInstances(true); });
+  $('#selRegion').addEventListener('change',async()=>{ S.region=$('#selRegion').value; $('#selInstance').innerHTML='<option value="">加载中...</option>'; await loadInstances(true); });
   $('#selInstance').addEventListener('change',()=>{ S.current=$('#selInstance').value; renderInstance(); });
   $('#btnRefresh').addEventListener('click',async()=>{ await loadInstances(false); toast('已刷新','success'); });
   $('#btnLogout').addEventListener('click',async()=>{ await api('logout'); location.reload(); });
@@ -2713,6 +2721,10 @@ async function loadInstances(reset){
     }else{ S.current=''; }
     renderInstance();
   }catch(e){
+    // 加载失败时清空旧下拉与状态：避免切换云/地域失败后，下拉框仍残留上一个云的实例造成误导
+    S.instances=[]; S.current='';
+    const el=$('#selInstance');
+    el.innerHTML='<option value="">加载失败：'+esc(e.message)+'</option>';
     $('#insCard').innerHTML='<div class="rounded-xl bg-red-50 text-red-700 text-sm px-4 py-3">'+esc(e.message)+'</div>';
     throw e;
   }
