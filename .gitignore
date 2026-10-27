@@ -1,0 +1,19 @@
+# 运行时产物
+lighthouse_panel.log
+*.log
+
+# 证书 / 临时文件
+cacert.pem
+*.pem
+
+# 本地测试
+_site/
+_php/
+_gh/
+_check.js
+_t*.mjs
+*.shot.png
+
+# 系统
+.DS_Store
+Thumbs.db

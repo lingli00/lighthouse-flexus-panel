@@ -1,10 +1,20 @@
-# 多云轻量服务器运维面板（腾讯轻量云 / 华为云 Flexus）
+# 轻量服务器运维面板 v1.2.0（华为 Flexus 主用 / 腾讯 Lighthouse 兼容 / 阿里云 DNS）
 
-单文件 PHP 运维面板：一个页面同时管理 **腾讯云轻量应用服务器（Lighthouse）** 与 **华为云 Flexus 云服务器（X实例 / L实例，底层 ECS）**，零依赖、无数据库、所有 UI / 弹窗 / 提示保持统一风格。
+单文件 PHP 运维面板：一个页面同时管理 **华为云 Flexus 云服务器（X实例 / L实例，底层 ECS）** 与 **腾讯云轻量应用服务器（Lighthouse）**，并内置 **阿里云云解析 DNS**。零依赖、无数据库、UI / 弹窗 / 提示风格统一。
 
-> ⚠️ 使用云 API 密钥（主账号密钥等同于账号最高权限）请务必知悉风险：建议使用仅授权对应产品权限的子账号 / IAM 子用户密钥，面板部署在 HTTPS 且仅本人访问。
+> 定位：**本项目主要面向华为轻量云 Flexus**；腾讯轻量云保持**可用**（兼容保留）。域名解析使用**阿里云云解析 DNS**，与服务器厂商无关。
+>
+> 面板内**不含任何代码托管 / 仓库同步功能**，只做运维；源码在本仓库维护，迭代后由开发者本地提交。
 
-## 功能（两侧一致的交集功能）
+## 顶部三个入口
+
+| 入口 | 说明 |
+|---|---|
+| 腾讯轻量云 | 可用（兼容保留），实例级运维 |
+| 华为云 | **主用**，Flexus X实例 / L实例 |
+| 域名解析 | 阿里云云解析 DNS 独立视图：记录增删改、启停、**备注编辑（写回控制台）** |
+
+## 功能（实例侧交集功能）
 
 | 功能 | 腾讯轻量云 | 华为云 Flexus |
 |---|---|---|
@@ -18,17 +28,30 @@
 | 操作日志（本地文件） | ✅ | ✅ |
 | 连通性测试 | ✅ 一键测试 | ✅ |
 | ProjectId 自动定位地域 | — | ✅（填完 ProjectId 自动切到对应区域） |
-| 阿里云域名解析（DNS） | — | ✅ 独立标签页：域名/解析记录增删改、暂停启用、连通性测试（RPC v1.0 HMAC-SHA1 签名，全链路实测） |
 
-其他能力：面板登录密码 + Session + CSRF、高危操作二次确认、操作日志落盘、手机端适配、密钥可前端配置也可服务端配置。
+### 域名解析（阿里云 DNS）
+
+| 能力 | 说明 |
+|---|---|
+| 域名 / 记录列表 | DescribeDomains / DescribeDomainRecords |
+| 添加 / 编辑 / 删除 | AddDomainRecord / UpdateDomainRecord / DeleteDomainRecord |
+| 暂停 / 启用 | SetDomainRecordStatus |
+| **备注编辑** | **UpdateDomainRecordRemark**：面板保存后阿里云控制台备注列同步更新，留空即清空；添加 / 编辑记录时填的备注也会一并同步 |
+| 连通性测试 | ✅ |
+
+## 其他能力
+
+面板登录密码 + Session + CSRF、高危操作二次确认、操作日志落盘（密钥不入日志）、手机端适配、密钥可前端配置也可服务端配置。
 
 ## 文件说明
 
 | 文件 | 作用 |
 |---|---|
-| `index.php` | **全部面板**（后端 API 代理 + 前端单页）。含腾讯 TC3-HMAC-SHA256 签名、华为 SDK-HMAC-SHA256（V4）签名、云厂商适配器（TencentAdapter / HuaweiAdapter）、登录鉴权、页面渲染 |
+| `index.php` | **全部面板**（后端 API 代理 + 前端单页）。含腾讯 TC3-HMAC-SHA256 签名、华为 SDK-HMAC-SHA256（V4）签名、阿里云 RPC v1.0 签名、登录鉴权、页面渲染 |
 | `HwV4Sign.php` | 华为云 V4 签名工具类独立版（与 index.php 内联版本一致，可单独 include 复用到其他项目） |
-| `教程-密钥配置.md` | 详细的密钥获取与填写教程（两家云 + 常见报错对照表） |
+| `教程-密钥配置.md` | 密钥获取与填写教程（两家云 + 阿里云 DNS + 常见报错对照表） |
+| `项目说明.md` | 项目简介、目录结构、功能定位、已知问题集中点 |
+| `AI-快速上手.md` | 换电脑后 AI 只读这一个文件即可接手本项目 |
 
 ## 部署
 
@@ -38,7 +61,7 @@
 
 ## 密钥配置（两种方式二选一，可共存）
 
-- **方式一（推荐）：网页配置** —— 顶部「密钥配置」填写 AK/SK（华为云另需 ProjectId），密钥仅保存在浏览器 localStorage，后端不落盘、不写日志、不入库。
+- **方式一（推荐）：网页配置** —— 顶部「密钥配置」填 AK/SK（华为云另需 ProjectId），密钥仅保存在浏览器 localStorage，后端不落盘、不写日志、不入库。
 - **方式二：服务端配置** —— 在 `index.php` 配置区写死：
   ```php
   // 腾讯
@@ -48,23 +71,29 @@
   define('HW_AK',      '你的AK');
   define('HW_SK',      '你的SK');
   define('HW_PROJECT', 'IAM项目ID');
-  // 阿里云 DNS（可选，用于「域名解析 DNS」标签页）
+  // 阿里云 DNS（用于「域名解析」入口）
   define('ALI_AK',     '你的AK');
   define('ALI_SK',     '你的SK');
   ```
   配置后页面会显示「服务端已配置密钥」徽标，前端可不再填写；若前端也填了，以前端为准。
 
-## 华为云签名实现说明
+## 签名实现说明
 
-零依赖自实现 SDK-HMAC-SHA256 签名（`HwV4Sign` 类），与官方 SDK（`AKSKSigner.java`）行为一致：
-
-- `Authorization: SDK-HMAC-SHA256 Access={AK}, SignedHeaders=host;x-sdk-date, Signature={HMAC-SHA256(StringToSign, SK)}`
-- **签名用 CanonicalURI 每段末尾补 `/`**（如 `/v1/{project_id}/cloudservers/detail/`），实际请求 URL 用正常路径 —— 官方规范「计算签名时 URI 必须以 / 结尾」，缺尾斜杠会报 `APIGW.0301 verify ak sk signature failed`。
+- **华为云**：零依赖自实现 SDK-HMAC-SHA256（`HwV4Sign` 类），与官方 SDK（`AKSKSigner.java`）行为一致：
+  `Authorization: SDK-HMAC-SHA256 Access={AK}, SignedHeaders=host;x-sdk-date, Signature=...`
+  **签名用 CanonicalURI 每段末尾补 `/`**，实际请求 URL 用正常路径；缺尾斜杠会报 `APIGW.0301 verify ak sk signature failed`。
+- **阿里云 DNS**：RPC v1.0，`Base64(HMAC-SHA1(StringToSign, SK + '&'))`，参数走查询串。
 
 ## 已实测验证
 
-以下均通过真实华为云 Flexus X实例 实测：签名（Access= + 尾斜杠 URI）、实例列表、EIP 带宽反查、BSS 到期时间、镜像列表（ECS 宿主路由 `/v2/{project_id}/images`）、CES 监控（24h→period 1200 / 7d→14400）、系统盘定位（nova 兼容路由 `/v2.1/{project_id}/servers/{id}/os-volume_attachments`）、安全组规则、快照列表。
+腾讯侧：实例列表、开关机、快照、监控、防火墙。华为侧：签名（Access= + 尾斜杠 URI）、实例列表、EIP 带宽反查、BSS 到期时间、镜像列表、CES 监控、系统盘定位、安全组规则、快照列表。阿里云：域名列表、记录增删改查、启停、备注同步（`UpdateDomainRecordRemark`）。
+
+## 版本
+
+- **v1.2.0**：域名解析上移为顶部一级入口 / 新增定位说明条 / 阿里云 DNS 备注编辑 / 移除腾讯主账号高危横幅 / 移除面板内仓库同步功能（改为开发者本地推送）
+- v1.1.0：多云（腾讯 + 华为）+ 阿里云 DNS
+- v1.0.x：腾讯轻量云单云面板
 
 ## 免责声明
 
-本项目按「现状」提供，使用本面板进行的任何云上操作（含重装、回滚等高危操作）后果由使用者自行承担。
+本项目按「现状」提供，使用本面板进行的任何云上操作（含重装、回滚等高危操作）后果由使用者自行承担。面板定位为**个人自用**，请部署在 HTTPS 且仅本人访问。
