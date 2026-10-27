@@ -1,33 +1,37 @@
 <?php
 /**
  * ============================================================================
- *  腾讯云轻量应用服务器（Lighthouse）运维面板 —— 单文件版
+ *  轻量服务器运维面板（华为轻量云 Flexus 主用 / 腾讯轻量云兼容 / 阿里云 DNS）
  * ----------------------------------------------------------------------------
  *  环境要求：PHP >= 7.4（推荐 8.0+），开启 curl、session 扩展（宝塔默认已开）
  *  部署方式：把本文件上传到宝塔站点根目录，改名/保持 index.php 直接访问
  *
- *  多云扩展说明（增量开发，未改动原有腾讯云逻辑）：
- *   - 顶部可切换【腾讯轻量云 / 华为云】；后端为适配器模式（TencentAdapter /
+ *  项目定位：
+ *   - 主要面向【华为轻量云 Flexus】（X实例 / L实例，底层 ECS）；
+ *   - 【腾讯轻量云 Lighthouse】保持可用，作为兼容保留；
+ *   - 【域名解析】使用阿里云云解析 DNS，与服务器厂商无关，顶部一级入口。
+ *
+ *  顶部三入口（v1.2.0 起「域名解析」从二级 Tab 上移到顶部）：
+ *   - 腾讯轻量云 / 华为云：实例侧运维，后端为适配器模式（TencentAdapter /
  *     HuaweiAdapter），统一输出实例字段 id / name / region / public_ip /
  *     status / cpu / memory / bandwidth，状态文本统一映射（state_cn）。
- *   - 密钥仅保存在前端浏览器 localStorage，随请求传给后端临时使用；后端
- *     不落盘、不写日志、不存数据库、不写会话。配置区常量仅作回退兼容。
- *   - 华为云为自实现 SDK-HMAC-SHA256（V4）签名，见 HwV4Sign 工具类；
- *     华为侧操作为异步任务，复用前端既有轮询逻辑观察状态。
+ *   - 域名解析：阿里云 DNS（RPC v1.0 签名），支持记录增删改 / 启停 /
+ *     备注编辑（UpdateDomainRecordRemark，写回阿里云控制台）。
  *
- *  ⚠️ 重要风险提示（写死在代码里，提醒每一次使用的人）
- *  本面板使用【腾讯云主账号 SecretId / SecretKey】调用云 API。主账号密钥 =
- *  账号最高权限，可销毁全部服务器、购买资源、访问全部云产品与账单。
- *  一旦密钥泄露，整个腾讯云账号将完全失控。使用者已明确知悉并自愿承担该风险。
- *  强烈建议：在 CAM 控制台创建仅授权 QcloudLighthouseFullAccess（或只读+指定
- *  操作）的【子账号密钥】后，把 AUTH_MODE 改成 'sub' 并替换密钥。
+ *  密钥处理：
+ *   - 前端 localStorage 保存，随请求传入后端临时使用；后端不落盘、不写日志、
+ *     不存数据库、不写会话。配置区常量仅作回退兼容（TC_* / HW_* / ALI_*）。
+ *   - 本面板定位为个人自用，已按需求移除腾讯云主账号高危横幅提示。
  *
  *  安全设计：
- *   1. 密钥只存在于 PHP 后端，绝不输出到 HTML / JS / 接口返回值
- *   2. 所有云 API 请求由 PHP 后端代理转发，前端不直接访问腾讯云
+ *   1. 密钥只存在于 PHP 后端内存，绝不输出到 HTML / JS / 接口返回值
+ *   2. 所有云 API 请求由 PHP 后端代理转发，前端不直接访问云厂商
  *   3. 面板独立密码 + Session 鉴权 + CSRF Token
- *   4. 高危操作（重装 / 重置密码 / 关机 / 删除安全组规则）红色强提示二次确认
+ *   4. 高危操作（重装 / 重置密码 / 关机 / 删除安全组规则）二次确认
  *   5. 所有操作写入本地日志文件，记录时间、IP、操作类型、实例、结果
+ *
+ *  说明：面板内不含任何代码托管 / 仓库同步功能；源码由开发者本地维护并推送到
+ *  GitHub 仓库用于后续迭代（见仓库根目录 README.md）。
  * ============================================================================
  */
 declare(strict_types=1);
@@ -88,7 +92,7 @@ define('ALI_AK', '');
 define('ALI_SK', '');
 
 // 面板版本（显示在「说明 / 风险」页的环境自检里，用于确认服务器上跑的是最新版）
-define('PANEL_VERSION', 'v1.1.0');
+define('PANEL_VERSION', 'v1.2.0');
 
 // 前端 CDN（如果服务器访问不畅，可自行下载文件放到站点目录并改成相对路径）
 define('CDN_TAILWIND', 'https://cdn.tailwindcss.com/3.4.1');
@@ -2083,7 +2087,9 @@ function ali_check_record(array $r): array
     if ($type === 'TXT' && strlen($value) > 512) throw new ApiError('TXT 记录值过长（≤512 字符）');
     if ($ttl < 600 || $ttl > 86400) throw new ApiError('TTL 取值范围 600~86400 秒');
     if ($type === 'MX' && ($prio < 1 || $prio > 50)) throw new ApiError('MX 优先级取值范围 1~50');
-    return ['rr' => $rr, 'type' => $type, 'value' => $value, 'ttl' => $ttl, 'priority' => $prio];
+    $remark = trim((string)($r['remark'] ?? ''));
+    if (str_len($remark) > 100) throw new ApiError('备注过长（≤100 字符，阿里云控制台同样限制）');
+    return ['rr' => $rr, 'type' => $type, 'value' => $value, 'ttl' => $ttl, 'priority' => $prio, 'remark' => $remark];
 }
 
 function biz_ali_record_add(array $d): array
@@ -2093,9 +2099,16 @@ function biz_ali_record_add(array $d): array
     $rec = ali_check_record((array)($d['record'] ?? []));
     $p = ['DomainName' => $domain, 'RR' => $rec['rr'], 'Type' => $rec['type'], 'Value' => $rec['value'], 'TTL' => $rec['ttl']];
     if ($rec['type'] === 'MX') $p['Priority'] = $rec['priority'];
-    ali_call('AddDomainRecord', $p);
-    write_log('AliDnsAdd', $domain . '/' . $rec['rr'], 'success', $rec['type'] . ' -> ' . $rec['value']);
-    return ['msg' => '解析记录已添加'];
+    $r  = ali_call('AddDomainRecord', $p);
+    $msg = '解析记录已添加';
+    // 备注不在 AddDomainRecord 参数里，需用独立接口按 RecordId 写入（写后阿里云控制台同步可见）
+    $rid = (string)($r['RecordId'] ?? '');
+    if ($rec['remark'] !== '' && $rid !== '') {
+        ali_call('UpdateDomainRecordRemark', ['RecordId' => $rid, 'Remark' => $rec['remark']]);
+        $msg .= '，备注已同步到阿里云控制台';
+    }
+    write_log('AliDnsAdd', $domain . '/' . $rec['rr'], 'success', $rec['type'] . ' -> ' . $rec['value'] . ($rec['remark'] !== '' ? ' | 备注：' . $rec['remark'] : ''));
+    return ['msg' => $msg];
 }
 
 function biz_ali_record_upd(array $d): array
@@ -2106,8 +2119,29 @@ function biz_ali_record_upd(array $d): array
     $p = ['RecordId' => $rid, 'RR' => $rec['rr'], 'Type' => $rec['type'], 'Value' => $rec['value'], 'TTL' => $rec['ttl']];
     if ($rec['type'] === 'MX') $p['Priority'] = $rec['priority'];
     ali_call('UpdateDomainRecord', $p);
-    write_log('AliDnsUpdate', $rid, 'success', $rec['type'] . ' -> ' . $rec['value']);
-    return ['msg' => '解析记录已更新'];
+    $msg = '解析记录已更新';
+    // 表单里带了备注字段就一并同步备注（UpdateDomainRecord 不含 Remark，需单独调用）
+    if (array_key_exists('remark', (array)($d['record'] ?? []))) {
+        ali_call('UpdateDomainRecordRemark', ['RecordId' => $rid, 'Remark' => $rec['remark']]);
+        $msg .= $rec['remark'] === '' ? '，备注已清空' : '，备注已同步到阿里云控制台';
+    }
+    write_log('AliDnsUpdate', $rid, 'success', $rec['type'] . ' -> ' . $rec['value'] . ' | 备注：' . ($rec['remark'] === '' ? '-' : $rec['remark']));
+    return ['msg' => $msg];
+}
+
+/** 仅修改备注（面板内直接管控，写回阿里云云解析控制台；空字符串 = 清空备注） */
+function biz_ali_record_remark(array $d): array
+{
+    $rid = trim((string)($d['recordId'] ?? ''));
+    if ($rid === '') throw new ApiError('缺少记录 ID，请刷新后重试');
+    $remark = trim((string)($d['remark'] ?? ''));
+    if (str_len($remark) > 100) throw new ApiError('备注过长（≤100 字符，阿里云控制台同样限制）');
+    ali_call('UpdateDomainRecordRemark', ['RecordId' => $rid, 'Remark' => $remark]);
+    write_log('AliDnsRemark', $rid, 'success', $remark === '' ? '清空备注' : '备注：' . $remark);
+    return [
+        'msg'    => $remark === '' ? '备注已清空（阿里云控制台已同步）' : '备注已保存（阿里云控制台已同步）',
+        'remark' => $remark,
+    ];
 }
 
 function biz_ali_record_del(array $d): array
@@ -2243,6 +2277,7 @@ function dispatch(string $action, array $d): void
             case 'ali_record_upd':    json_out(['ok' => true, 'data' => biz_ali_record_upd($d)]);
             case 'ali_record_del':    json_out(['ok' => true, 'data' => biz_ali_record_del($d)]);
             case 'ali_record_status': json_out(['ok' => true, 'data' => biz_ali_record_status($d)]);
+            case 'ali_record_remark': json_out(['ok' => true, 'data' => biz_ali_record_remark($d)]);
             case 'log_list':    json_out(['ok' => true, 'data' => ['logs' => read_logs(200), 'file' => LOG_FILE]]);
             default:            json_out(['ok' => false, 'msg' => '未知操作：' . $action]);
         }
@@ -2315,7 +2350,7 @@ function render_login(): void
       <div class="text-center mb-6">
         <div class="w-14 h-14 mx-auto rounded-2xl bg-blue-600 text-white flex items-center justify-center text-2xl font-bold">LH</div>
         <h1 class="mt-4 text-xl font-bold text-slate-800">轻量服务器运维面板</h1>
-        <p class="text-sm text-slate-500 mt-1">Tencent Lighthouse / Huawei ECS Panel</p>
+        <p class="text-sm text-slate-500 mt-1">Huawei Flexus 主用 · Tencent Lighthouse 兼容 · Aliyun DNS</p>
       </div>
       <div id="tip" class="hidden mb-4 text-sm rounded-xl px-4 py-3"></div>
       <form id="loginForm" autocomplete="off">
@@ -2414,38 +2449,41 @@ function render_page(): void
 
 <!-- 顶部 -->
 <header class="bg-white border-b border-slate-200 sticky top-0 z-30">
-  <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between gap-3">
-    <div class="flex items-center gap-3 min-w-0">
+  <div class="max-w-7xl mx-auto px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+    <div class="flex items-center gap-3 min-w-0 flex-1 sm:flex-none order-1">
       <div class="w-9 h-9 shrink-0 rounded-xl bg-blue-600 text-white flex items-center justify-center font-bold">LH</div>
       <div class="min-w-0">
         <div class="font-bold text-slate-800 leading-tight truncate">轻量服务器运维面板</div>
-        <div class="text-xs text-slate-400 truncate">Lighthouse / ECS · API 直连运维</div>
+        <div class="text-xs text-slate-400 truncate">华为 Flexus 主用 · 腾讯 Lighthouse 兼容 · 阿里云 DNS</div>
       </div>
     </div>
-    <!-- 云厂商切换：腾讯轻量云 / 华为云（沿用 tab-active 选中样式） -->
-    <div class="flex items-center gap-1 bg-slate-100 rounded-xl p-1">
-      <button id="cloudTab-tencent" class="cloud-tab px-3 py-1.5 rounded-lg text-sm font-medium transition">腾讯轻量云</button>
-      <button id="cloudTab-huawei" class="cloud-tab px-3 py-1.5 rounded-lg text-sm font-medium transition">华为云</button>
+    <!-- 模块切换：腾讯轻量云 / 华为云 / 域名解析（阿里云 DNS）—— 域名解析已提到顶部 -->
+    <div class="flex items-center gap-1 bg-slate-100 rounded-xl p-1 order-3 sm:order-2 w-full sm:w-auto">
+      <button id="cloudTab-tencent" class="cloud-tab flex-1 sm:flex-none px-3 py-1.5 rounded-lg text-sm font-medium transition whitespace-nowrap">腾讯轻量云</button>
+      <button id="cloudTab-huawei" class="cloud-tab flex-1 sm:flex-none px-3 py-1.5 rounded-lg text-sm font-medium transition whitespace-nowrap">华为云</button>
+      <span class="w-px h-5 bg-slate-300 mx-0.5 shrink-0"></span>
+      <button id="cloudTab-dns" class="cloud-tab flex-1 sm:flex-none px-3 py-1.5 rounded-lg text-sm font-medium transition whitespace-nowrap">域名解析</button>
     </div>
-    <div class="flex items-center gap-2">
+    <div class="flex items-center gap-2 order-2 sm:order-3 shrink-0">
       <span id="credBadge" class="hidden text-xs px-2 py-1 rounded-lg"></span>
       <span id="authBadge" class="hidden text-xs px-2 py-1 rounded-lg"></span>
-      <button id="btnCred" class="text-sm px-3 py-2 rounded-xl border border-blue-600 text-blue-600 hover:bg-blue-50 transition">密钥配置</button>
-      <button id="btnLogout" class="text-sm px-3 py-2 rounded-xl border border-slate-300 hover:bg-slate-100 transition">退出</button>
+      <button id="btnCred" class="text-sm px-3 py-2 rounded-xl border border-blue-600 text-blue-600 hover:bg-blue-50 transition whitespace-nowrap">密钥配置</button>
+      <button id="btnLogout" class="text-sm px-3 py-2 rounded-xl border border-slate-300 hover:bg-slate-100 transition whitespace-nowrap">退出</button>
     </div>
   </div>
 </header>
 
-<!-- 主账号风险横幅 -->
-<div id="riskBanner" class="hidden max-w-7xl mx-auto px-4 pt-4">
-  <div class="rounded-2xl border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-700 leading-relaxed">
-    <b>⚠ 高危提示：</b>当前使用<b>腾讯云主账号密钥</b>调用 API，该密钥等同于账号最高权限（可销毁全部资源、购买资源、访问全部云产品与账单）。
-    请务必：① 面板部署在 HTTPS 且仅本人访问；② 定期轮换密钥；③ 尽快在 CAM 创建仅授权轻量服务器的子账号密钥替换（改配置区 AUTH_MODE 为 sub）。
+<!-- 定位说明条（仅说明用途，非风险提示） -->
+<div class="max-w-7xl mx-auto px-4 pt-3">
+  <div class="rounded-xl border border-slate-200 bg-white px-4 py-2.5 flex flex-wrap items-center gap-x-5 gap-y-1.5 text-xs text-slate-500">
+    <span class="flex items-center gap-1.5"><span class="w-1.5 h-1.5 rounded-full bg-green-500"></span>腾讯轻量云：<b class="font-medium text-slate-600">可用</b>（兼容保留）</span>
+    <span class="flex items-center gap-1.5"><span class="w-1.5 h-1.5 rounded-full bg-blue-500"></span>本项目<b class="font-medium text-slate-700">主要面向华为轻量云 Flexus</b></span>
+    <span class="flex items-center gap-1.5"><span class="w-1.5 h-1.5 rounded-full bg-amber-500"></span>域名解析：<b class="font-medium text-slate-600">阿里云云解析 DNS</b>（含备注同步）</span>
   </div>
 </div>
 
 <!-- 实例选择栏 -->
-<div class="max-w-7xl mx-auto px-4 py-4">
+<div id="insBar" class="max-w-7xl mx-auto px-4 py-4">
   <div class="bg-white rounded-2xl shadow-sm p-4 flex flex-col md:flex-row md:items-center gap-3">
     <div class="flex-1 grid grid-cols-1 md:grid-cols-2 gap-3">
       <div>
@@ -2464,15 +2502,14 @@ function render_page(): void
 </div>
 
 <!-- Tab -->
-<div class="max-w-7xl mx-auto px-4">
+<div id="tabBar" class="max-w-7xl mx-auto px-4">
   <div class="flex flex-wrap gap-2 mb-4">
     <button class="tab-btn tab-active px-4 py-2 rounded-xl text-sm bg-white border border-slate-200" data-tab="overview">实例概览</button>
     <button class="tab-btn px-4 py-2 rounded-xl text-sm bg-white border border-slate-200" data-tab="firewall">安全组 / 防火墙</button>
     <button class="tab-btn px-4 py-2 rounded-xl text-sm bg-white border border-slate-200" data-tab="snapshot">快照备份</button>
     <button class="tab-btn px-4 py-2 rounded-xl text-sm bg-white border border-slate-200" data-tab="monitor">监控</button>
     <button class="tab-btn px-4 py-2 rounded-xl text-sm bg-white border border-slate-200" data-tab="logs">操作日志</button>
-    <button class="tab-btn px-4 py-2 rounded-xl text-sm bg-white border border-slate-200" data-tab="dns">域名解析 DNS</button>
-    <button class="tab-btn px-4 py-2 rounded-xl text-sm bg-white border border-slate-200" data-tab="about">说明 / 风险</button>
+    <button class="tab-btn px-4 py-2 rounded-xl text-sm bg-white border border-slate-200" data-tab="about">说明</button>
   </div>
 </div>
 
@@ -2585,13 +2622,13 @@ function render_page(): void
     </div>
   </section>
 
-  <!-- ============ 域名解析 DNS（阿里云） ============ -->
+  <!-- ============ 域名解析 DNS（阿里云）—— 顶部独立视图 ============ -->
   <section id="tab-dns" class="tab-pane hidden">
     <div class="bg-white rounded-2xl shadow-sm p-5">
       <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
         <div>
           <h2 class="font-bold text-slate-800">域名解析（阿里云云解析 DNS）<span id="dnsDomain" class="text-xs font-normal text-slate-400"></span></h2>
-          <p class="text-xs text-slate-400 mt-1">解析记录管理：添加 / 编辑 / 删除 / 暂停启用。密钥仅存浏览器 localStorage 或 index.php 配置区，后端不持久化。</p>
+          <p class="text-xs text-slate-400 mt-1">解析记录管理：添加 / 编辑 / 删除 / 暂停启用 / <b class="font-medium text-slate-500">备注编辑（写回阿里云控制台）</b>。密钥仅存浏览器 localStorage 或 index.php 配置区，后端不持久化。</p>
         </div>
         <div class="flex flex-wrap gap-2">
           <button id="btnDnsKey" class="px-4 py-2 rounded-xl border border-blue-600 text-blue-600 text-sm hover:bg-blue-50">DNS 密钥配置</button>
@@ -2607,12 +2644,13 @@ function render_page(): void
       <div class="overflow-x-auto rounded-xl border border-slate-200">
         <table class="min-w-full text-sm">
           <thead class="bg-slate-50 text-slate-500 text-xs">
-            <tr><th class="px-4 py-3 text-left">主机记录</th><th class="px-4 py-3 text-left">类型</th><th class="px-4 py-3 text-left">记录值</th><th class="px-4 py-3 text-left">TTL(秒)</th><th class="px-4 py-3 text-left">优先级</th><th class="px-4 py-3 text-left">状态</th><th class="px-4 py-3 text-right">操作</th></tr>
+            <tr><th class="px-4 py-3 text-left">主机记录</th><th class="px-4 py-3 text-left">类型</th><th class="px-4 py-3 text-left">记录值</th><th class="px-4 py-3 text-left">备注</th><th class="px-4 py-3 text-left">TTL(秒)</th><th class="px-4 py-3 text-left">优先级</th><th class="px-4 py-3 text-left">状态</th><th class="px-4 py-3 text-right">操作</th></tr>
           </thead>
           <tbody id="dnsBody" class="divide-y divide-slate-100"></tbody>
         </table>
       </div>
       <div id="dnsEmpty" class="hidden text-center text-sm text-slate-400 py-8">暂无解析记录</div>
+      <p class="text-xs text-slate-400 mt-3">备注通过阿里云 <code class="px-1 rounded bg-slate-100">UpdateDomainRecordRemark</code> 接口写入，面板保存后阿里云控制台「解析记录备注」列同步生效，清空备注同样同步。</p>
     </div>
   </section>
 
@@ -2620,12 +2658,23 @@ function render_page(): void
   <section id="tab-about" class="tab-pane hidden">
     <div class="bg-white rounded-2xl shadow-sm p-5 text-sm leading-relaxed text-slate-600 space-y-4">
       <div class="rounded-xl bg-blue-50 p-4">
-        <h2 class="font-bold text-slate-800 mb-2">多云说明（腾讯 / 华为）</h2>
+        <h2 class="font-bold text-slate-800 mb-2">模块说明（华为主用 / 腾讯兼容 / 阿里云 DNS）</h2>
         <ul class="list-disc pl-5 space-y-1">
-          <li>顶部可切换【腾讯轻量云 / 华为云】；两侧均支持：实例列表、开机、关机、重启、快照（创建 / 删除 / 回滚）、监控、重置密码、重装系统、安全组规则、操作日志。</li>
+          <li>本项目<b>主要面向华为轻量云 Flexus</b>（X实例 / L实例，底层 ECS）；腾讯轻量云（Lighthouse）保持<b>可用</b>，作为兼容保留。</li>
+          <li>顶部三入口：【腾讯轻量云】【华为云】【域名解析】。域名解析使用<b>阿里云云解析 DNS</b>，与服务器厂商无关，独立密钥、独立视图。</li>
+          <li>实例侧两端均支持：实例列表、开机、关机、重启、快照（创建 / 删除 / 回滚）、监控、重置密码、重装系统、安全组规则、操作日志。</li>
           <li>后端为适配器模式：TencentAdapter 复用原有 biz_* 逻辑；HuaweiAdapter 基于 HwV4Sign（SDK-HMAC-SHA256 V4）零依赖自实现，华为异步操作复用前端既有轮询。</li>
           <li>密钥仅存于浏览器 localStorage，后端不持久化；可在顶部「密钥配置」中填写并一键测试连通性。</li>
           <li>华为侧差异：安全组仅支持放行规则；重装系统（切换操作系统）需先关机；内存 / 网络监控需安装 CES Agent；快照针对系统盘（EVS 云快照）。</li>
+        </ul>
+      </div>
+      <div class="rounded-xl bg-slate-50 p-4">
+        <h2 class="font-bold text-slate-800 mb-2">v1.2.0 更新内容</h2>
+        <ul class="list-disc pl-5 space-y-1">
+          <li>域名解析模块上移为顶部一级入口，与【腾讯轻量云】【华为云】并列。</li>
+          <li>新增定位说明条：腾讯轻量云可用、本项目主要面向华为轻量云、域名解析为阿里云 DNS。</li>
+          <li>阿里云 DNS 新增<b>备注编辑</b>：面板修改后通过 UpdateDomainRecordRemark 写回阿里云，控制台同步可见，可直接在运维面板管控。</li>
+          <li>移除腾讯云板块上方的主账号高危横幅（本面板仅个人使用）。</li>
         </ul>
       </div>
       <div>
@@ -2639,22 +2688,24 @@ function render_page(): void
           <li>GetMonitorData（QCE/LIGHTHOUSE）—— CPU、内存、出入带宽</li>
           <li>ModifyInstanceName —— 实例改名</li>
           <li>DescribeRegions —— 地域列表</li>
+          <li>阿里云 DNS：DescribeDomains / DescribeDomainRecords / AddDomainRecord / UpdateDomainRecord / DeleteDomainRecord / SetDomainRecordStatus / <b>UpdateDomainRecordRemark（备注）</b></li>
         </ul>
       </div>
       <div class="rounded-xl bg-slate-50 p-4">
-        <h2 class="font-bold text-slate-800 mb-2">安全与风险</h2>
+        <h2 class="font-bold text-slate-800 mb-2">安全与使用</h2>
         <ol class="list-decimal pl-5 space-y-1">
-          <li>密钥仅存于服务端 PHP 配置区，前端 HTML / JS / 接口返回中均不含密钥；全部请求经后端代理。</li>
+          <li>密钥仅存于浏览器 localStorage / 服务端 PHP 配置区，前端 HTML / JS / 接口返回中均不含密钥；全部请求经后端代理。</li>
           <li>面板独立密码 + Session（超时自动登出）+ CSRF Token；连续 5 次密码错误锁定 5 分钟。</li>
-          <li>重装系统、重置密码、关机、删除防火墙规则均需红色强提示二次确认。</li>
-          <li>所有操作写入本地日志文件（时间、IP、操作类型、实例、结果）。</li>
-          <li><b class="text-red-600">强烈建议切换为子账号密钥</b>：CAM 新建子用户 → 仅授予 QcloudLighthouseFullAccess（按需可改只读）→ 生成密钥 → 替换配置区密钥并把 AUTH_MODE 改为 sub。一旦主账号密钥泄露，整个腾讯云账号将完全失控。</li>
+          <li>重装系统、重置密码、关机、删除防火墙规则均需二次确认。</li>
+          <li>所有操作写入本地日志文件（时间、IP、操作类型、实例、结果），<b>密钥与 Token 均不入日志</b>。</li>
+          <li>本面板为个人自用，部署在 HTTPS 且仅本人访问即可；如需长期多人使用，建议改用仅授权对应产品的子账号 / IAM 子用户密钥。</li>
         </ol>
       </div>
       <div class="rounded-xl bg-slate-50 p-4">
         <h2 class="font-bold text-slate-800 mb-2">已知平台限制</h2>
         <ul class="list-disc pl-5 space-y-1">
           <li>轻量服务器防火墙 API 只有一组规则（实例级入站方向），无独立出站规则接口，出站默认全放行。</li>
+          <li>阿里云 DNS 备注走独立接口（UpdateDomainRecordRemark），限 100 字符；备注仅用于标注，不参与解析。</li>
           <li>本机运行面板时若提示“签名过期”，请检查服务器系统时间（宝塔 → 时间同步 / NTP）。</li>
           <li>重装 / 重置密码后需要几分钟生效；Windows 实例建议重装时一并设置新密码。</li>
         </ul>
@@ -2732,11 +2783,13 @@ async function api(action,data){
 
 /* ---------- 状态 ---------- */
 const S={
-  snapshots: [], region:CFG.region, instances:[], current:'', blueprints:{}, charts:{}, timer:null };
+  snapshots: [], region:CFG.region, instances:[], current:'', blueprints:{}, charts:{}, timer:null,
+  view:'cloud', tab:'overview' };
 
 /* ---------- 初始化 ---------- */
 /* ---------- 多云：云切换状态 + 密钥（仅前端 localStorage，后端不持久化） ---------- */
 S.cloud = localStorage.getItem('lhpanel.cloud.v1')==='huawei' ? 'huawei' : 'tencent';
+S.view  = localStorage.getItem('lhpanel.view.v1')==='dns' ? 'dns' : 'cloud';
 function loadCred(){
   let c={};
   try{ c=JSON.parse(localStorage.getItem('lhpanel.cred.v1')||'{}'); }catch(e){}
@@ -2751,30 +2804,56 @@ function curCred(){
   const c=S.cred[S.cloud]||{};
   return {ak:c.ak||'', sk:c.sk||'', project:c.project||''};
 }
-/* 顶部云切换按钮样式（沿用 tab-active）+ 风险横幅 / 密钥徽标（腾讯侧沿用原有逻辑） */
+/* 顶部三个入口按钮样式（腾讯轻量云 / 华为云 / 域名解析）+ 密钥徽标 */
 function applyCloudUI(){
+  const activeId = S.view==='dns' ? 'cloudTab-dns' : 'cloudTab-'+S.cloud;
   $$('.cloud-tab').forEach(b=>{
-    const on = b.id==='cloudTab-'+S.cloud;
+    const on = b.id===activeId;
     b.classList.toggle('tab-active',on);
     if(on){ b.classList.add('bg-blue-600','text-white'); b.classList.remove('bg-white','text-slate-600'); }
     else  { b.classList.remove('bg-blue-600','text-white'); b.classList.add('bg-white','text-slate-600'); }
   });
   const b=$('#authBadge');
-  if(S.cloud!=='tencent'){
-    // 华为侧密钥来自前端配置，不展示主/子账号徽标
-    $('#riskBanner').classList.add('hidden');
+  const bc=$('#btnCred');
+  if(bc) bc.textContent = S.view==='dns' ? 'DNS 密钥' : '密钥配置';
+  if(S.view==='dns' || S.cloud!=='tencent'){
+    // 域名解析视图与华为侧密钥均来自前端配置，不展示腾讯主/子账号徽标
     b.classList.add('hidden');
   }else if(CFG.authMode==='main'){
-    $('#riskBanner').classList.remove('hidden');
-    b.className='text-xs px-2 py-1 rounded-lg bg-red-100 text-red-700 font-medium';
+    b.className='text-xs px-2 py-1 rounded-lg bg-slate-100 text-slate-600 font-medium';
     b.textContent='主账号密钥';
     b.classList.remove('hidden');
   }else{
-    $('#riskBanner').classList.remove('hidden');
     b.className='text-xs px-2 py-1 rounded-lg bg-green-100 text-green-700 font-medium';
     b.textContent='子账号密钥';
     b.classList.remove('hidden');
   }
+}
+/* ---------- 视图切换：实例侧（二级 Tab）/ 域名解析（顶部一级入口） ---------- */
+const PANES=['overview','firewall','snapshot','monitor','logs','about','dns'];
+function showTab(name){
+  if(PANES.indexOf(name)<0) name='overview';
+  S.tab=name;
+  $$('.tab-btn').forEach(b=>{
+    const on=b.dataset.tab===name;
+    b.classList.toggle('tab-active',on);
+    b.classList.toggle('bg-blue-600',on);
+    b.classList.toggle('text-white',on);
+  });
+  PANES.forEach(p=>{ const el=$('#tab-'+p); if(el) el.classList.toggle('hidden', p!==name); });
+  if(name==='firewall') loadFw();
+  if(name==='snapshot') loadSnapshots();
+  if(name==='monitor') loadMonitor();
+  if(name==='logs') loadLogs();
+  if(name==='dns') loadDnsDomains();
+}
+function applyView(){
+  const isDns = S.view==='dns';
+  $('#insBar').classList.toggle('hidden', isDns);   // 域名解析与实例无关，隐藏地域/实例选择栏
+  $('#tabBar').classList.toggle('hidden', isDns);   // 域名解析为一级入口，不再占用二级 Tab
+  applyCloudUI();
+  if(isDns) showTab('dns');
+  else showTab(S.tab==='dns' ? 'overview' : S.tab);
 }
 /* 应用后端下发的密码规则（各云要求不同） */
 function applyPwdRule(r){
@@ -2795,13 +2874,22 @@ function applyBackendCredBadge(on){
   if(typeof tailwind==='undefined'){
     document.body.insertAdjacentHTML('afterbegin','<div class="bg-amber-50 text-amber-800 text-sm px-4 py-2 text-center">Tailwind CSS CDN 未加载成功，页面样式可能不完整（不影响功能）。可在配置区更换 CDN 地址。</div>');
   }
-  applyCloudUI();
-  // 云厂商切换：重新拉取地域与实例（沿用原有加载逻辑）
+  applyView();
+  // 顶部三入口切换：腾讯轻量云 / 华为云 → 实例视图；域名解析 → 阿里云 DNS 独立视图
   $$('.cloud-tab').forEach(b=>b.addEventListener('click',async()=>{
     const target=b.id.replace('cloudTab-','');
-    if(S.cloud===target) return;
+    if(target==='dns'){
+      if(S.view==='dns') return;
+      S.view='dns'; localStorage.setItem('lhpanel.view.v1','dns');
+      applyView();
+      toast('已切换到域名解析（阿里云 DNS）','success');
+      return;
+    }
+    const wasDns=S.view==='dns', same=S.cloud===target;
+    S.view='cloud'; localStorage.setItem('lhpanel.view.v1','cloud');
     S.cloud=target; localStorage.setItem('lhpanel.cloud.v1',S.cloud);
-    applyCloudUI();
+    applyView();
+    if(same && !wasDns) return;
     $('#selInstance').innerHTML='<option value="">加载中...</option>'; // 清掉上一个云的残留
     try{
       const boot=await api('bootstrap');
@@ -2824,7 +2912,11 @@ function applyBackendCredBadge(on){
     applyPwdRule(boot.pwdRule);
     applyBackendCredBadge(!!boot.backendCred);
     await loadInstances(true);
-  }catch(e){ toast(e.message,'error'); }
+  }catch(e){
+    toast(e.message,'error');
+    // 首次进入且尚未配置密钥时，概览卡片给出明确提示，避免出现空白区域
+    if(!S.instances.length) $('#insCard').innerHTML='<div class="rounded-xl bg-amber-50 text-amber-800 text-sm px-4 py-3">'+esc(e.message)+'</div>';
+  }
 })();
 
 /* ---------- 密钥配置（仅存浏览器 localStorage，含连通性测试） ---------- */
@@ -2911,20 +3003,7 @@ function fillRegions(regions,sel){
 }
 
 function bindTabs(){
-  $$('.tab-btn').forEach(btn=>{
-    btn.addEventListener('click',()=>{
-      $$('.tab-btn').forEach(b=>b.classList.remove('tab-active','bg-blue-600','text-white'));
-      btn.classList.add('tab-active','bg-blue-600','text-white');
-      const name=btn.dataset.tab;
-      $$('.tab-pane').forEach(p=>p.classList.add('hidden'));
-      $('#tab-'+name).classList.remove('hidden');
-      if(name==='firewall') loadFw();
-      if(name==='snapshot') loadSnapshots();
-      if(name==='monitor') loadMonitor();
-      if(name==='logs') loadLogs();
-      if(name==='dns') loadDnsDomains();
-    });
-  });
+  $$('.tab-btn').forEach(btn=>btn.addEventListener('click',()=>showTab(btn.dataset.tab)));
 }
 
 function bindEvents(){
@@ -2932,7 +3011,8 @@ function bindEvents(){
   $('#selInstance').addEventListener('change',()=>{ S.current=$('#selInstance').value; renderInstance(); });
   $('#btnRefresh').addEventListener('click',async()=>{ await loadInstances(false); toast('已刷新','success'); });
   $('#btnLogout').addEventListener('click',async()=>{ await api('logout'); location.reload(); });
-  $('#btnCred').addEventListener('click',openCredForm);
+  // 顶部「密钥配置」随当前视图切换目标：域名解析视图 → 阿里云 DNS 密钥
+  $('#btnCred').addEventListener('click',()=>{ S.view==='dns' ? openDnsKeyForm() : openCredForm(); });
 
   $$('.rng-btn').forEach(b=>{
     b.addEventListener('click',()=>{
@@ -3589,16 +3669,19 @@ function renderDnsRecords(list){
   empty.classList.add('hidden');
   body.innerHTML=list.map((r,idx)=>{
     const on=r.status==='ENABLE';
+    const remark=r.remark||'';
     return `
     <tr class="hover:bg-slate-50">
       <td class="px-4 py-3 font-medium text-slate-700">${esc(r.rr)}</td>
       <td class="px-4 py-3"><span class="text-xs px-2 py-1 rounded-lg bg-slate-100 text-slate-600">${esc(r.type)}</span></td>
-      <td class="px-4 py-3 text-slate-600 break-all max-w-[280px]">${esc(r.value)}</td>
+      <td class="px-4 py-3 text-slate-600 break-all max-w-[260px]">${esc(r.value)}</td>
+      <td class="px-4 py-3 text-slate-500 max-w-[200px]"><div class="truncate" title="${esc(remark)}">${remark?esc(remark):'<span class="text-slate-300">—</span>'}</div></td>
       <td class="px-4 py-3 text-slate-500">${r.ttl}</td>
       <td class="px-4 py-3 text-slate-500">${r.type==='MX'?r.priority:'-'}</td>
       <td class="px-4 py-3"><span class="text-xs px-2 py-1 rounded-lg ${on?'bg-green-100 text-green-700':'bg-slate-100 text-slate-500'}">${on?'启用':'已暂停'}</span>${r.locked?'<div class="text-[11px] text-amber-600 mt-1">🔒 已锁定</div>':''}</td>
       <td class="px-4 py-3 text-right whitespace-nowrap">
         <button data-act="edit" data-idx="${idx}" class="dns-btn text-xs px-3 py-1.5 rounded-lg bg-blue-50 text-blue-600 hover:bg-blue-100">编辑</button>
+        <button data-act="remark" data-idx="${idx}" class="dns-btn text-xs px-3 py-1.5 rounded-lg bg-indigo-50 text-indigo-600 hover:bg-indigo-100">备注</button>
         <button data-act="toggle" data-idx="${idx}" ${r.locked?'disabled class="dns-btn text-xs px-3 py-1.5 rounded-lg bg-slate-100 text-slate-400 cursor-not-allowed"':'class="dns-btn text-xs px-3 py-1.5 rounded-lg bg-amber-50 text-amber-700 hover:bg-amber-100"'}>${on?'暂停':'启用'}</button>
         <button data-act="del" data-idx="${idx}" ${r.locked?'disabled class="dns-btn text-xs px-3 py-1.5 rounded-lg bg-slate-100 text-slate-400 cursor-not-allowed"':'class="dns-btn text-xs px-3 py-1.5 rounded-lg bg-red-50 text-red-600 hover:bg-red-100"'}>删除</button>
       </td>
@@ -3606,7 +3689,9 @@ function renderDnsRecords(list){
   }).join('');
   $$('#dnsBody .dns-btn').forEach(b=>b.addEventListener('click',()=>{
     const r=list[+b.dataset.idx];
-    if(!r||r.locked) return;
+    if(!r) return;
+    if(b.dataset.act==='remark') { openDnsRemarkForm(r); return; } // 备注不受「已锁定」影响，仍可编辑
+    if(r.locked) return;
     if(b.dataset.act==='edit') openDnsForm(r);
     else if(b.dataset.act==='del') askDeleteDns(r);
     else toggleDnsStatus(r);
@@ -3644,11 +3729,16 @@ function openDnsForm(rec){
         </div>
       </div>
       <div class="text-xs text-slate-400">提示：相同主机记录+类型只能有一条（冲突会报错）；TTL 越小变更生效越快，但解析请求量越大。</div>
+      <div>
+        <label class="block text-xs text-slate-500 mb-1">备注（可选，≤100 字符，保存后同步到阿里云控制台）</label>
+        <input id="dRemark" maxlength="100" class="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm" value="${esc(rec?(rec.remark||''):'')}" placeholder="例如：官网主域名 / 小程序接口">
+      </div>
     </div>`,isEdit?'保存修改':'添加',async()=>{
       const record={
         rr:$('#dRr').value.trim(), type:$('#dType').value,
         value:$('#dValue').value.trim(), ttl:parseInt($('#dTtl').value,10)||600,
-        priority:parseInt($('#dPriority').value,10)||10
+        priority:parseInt($('#dPriority').value,10)||10,
+        remark:$('#dRemark').value.trim()
       };
       if(!record.rr){ toast('请填写主机记录（根域名填 @）','error'); return; }
       if(!record.value){ toast('请填写记录值','error'); return; }
@@ -3658,6 +3748,27 @@ function openDnsForm(rec){
           ? await api('ali_record_upd',{cred:aliCred(),recordId:rec.id,record:record})
           : await api('ali_record_add',{cred:aliCred(),domain:S.dns.domain,record:record});
         toast(d.msg,'success'); loadDnsRecords();
+      }catch(e){ toast(e.message,'error'); }
+    },false);
+}
+/* 备注快捷编辑：只改备注、不动解析内容，写回阿里云控制台 */
+function openDnsRemarkForm(r){
+  openMask('编辑备注 · '+r.rr+(S.dns.domain?(' · '+S.dns.domain):''),`
+    <div class="space-y-3">
+      <div class="rounded-xl bg-slate-50 px-4 py-3 text-sm text-slate-600 leading-relaxed">
+        <div>主机记录：<b>${esc(r.rr)}</b>　类型：<b>${esc(r.type)}</b></div>
+        <div class="break-all mt-1">记录值：<b>${esc(r.value)}</b></div>
+      </div>
+      <div>
+        <label class="block text-xs text-slate-500 mb-1">备注（≤100 字符，留空即清除备注）</label>
+        <textarea id="dRemark" rows="3" maxlength="100" class="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm" placeholder="例如：官网主域名 / 小程序接口 / 邮件验证">${esc(r.remark||'')}</textarea>
+      </div>
+      <div class="text-xs text-slate-400">保存后由面板调用阿里云 UpdateDomainRecordRemark 接口写入，阿里云云解析控制台的「备注」列会同步更新，无需再登录控制台。</div>
+    </div>`,'保存备注',async()=>{
+      const remark=$('#dRemark').value.trim();
+      try{
+        const d=await api('ali_record_remark',{cred:aliCred(),recordId:r.id,remark:remark});
+        closeMask(); toast(d.msg,'success'); loadDnsRecords();
       }catch(e){ toast(e.message,'error'); }
     },false);
 }
